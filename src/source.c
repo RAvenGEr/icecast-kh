@@ -59,6 +59,7 @@
 #include "fserve.h"
 #include "auth.h"
 #include "slave.h"
+#include "curl_ice.h"
 
 #undef CATMODULE
 #define CATMODULE "source"
@@ -93,6 +94,189 @@ static int  source_set_override (mount_proxy *mountinfo, source_t *dest_source, 
 #else
 static void source_run_script (char *command, char *mountpoint);
 #endif
+
+typedef enum {
+    LISTENER_ACTION_CONNECT,
+    LISTENER_ACTION_DISCONNECT,
+} listener_action_type_t;
+
+/* Task struct doe background worker to run listener actions
+ */
+typedef struct listener_action_task_s {
+    struct listener_action_task_s *next;
+    listener_action_type_t type;
+    uint64_t id;
+    char *ip;
+    char *user_agent;
+    const char *mount;
+    const char *action_url;
+} listener_action_task_t;
+
+static mutex_t _listener_action_lock;
+static cond_t _listener_action_cond;
+static listener_action_task_t *listener_actions_head = NULL;
+static listener_action_task_t **listener_actions_tail = &listener_actions_head;
+static int listener_action_thread_running = 0;
+
+static void listener_action_free_task(listener_action_task_t *t)
+{
+    if (!t) return;
+    if (t->ip) free(t->ip);
+    if (t->user_agent) free(t->user_agent);
+    free(t);
+}
+
+#if HAVE_CURL
+
+static size_t listener_header (void *ptr, size_t size, size_t nmemb, void *user)
+{
+    (void)ptr;
+    (void)user;
+    return size * nmemb;
+}
+
+static size_t listener_data (void *ptr, size_t size, size_t nmemb, void *user)
+{
+    (void)ptr;
+    (void)user;
+    return size * nmemb;
+}
+
+static void listener_action_report(listener_action_task_t* t)
+{
+    CURLU *url = curl_url ();
+    CURLUcode rc = curl_url_set (url, CURLUPART_URL, t->action_url, 0);
+    char convert[100];
+    snprintf (convert, sizeof(convert), "id=%"PRIu64, t->id);
+    curl_url_set (url, CURLUPART_QUERY, convert, 0);
+    if (t->mount[0] == '/') ++t->mount;
+    snprintf (convert, sizeof(convert), "m=%s", t->mount);
+    curl_url_set (url, CURLUPART_QUERY, convert, CURLU_URLENCODE | CURLU_APPENDQUERY);
+    if (t->user_agent)
+    {
+        snprintf (convert, sizeof(convert), "ua=%s", t->user_agent);
+        curl_url_set (url, CURLUPART_QUERY, convert, CURLU_URLENCODE | CURLU_APPENDQUERY);
+    }
+    if (t->ip)
+    {
+        snprintf (convert, sizeof(convert), "ip=%s", t->ip);
+        curl_url_set (url, CURLUPART_QUERY, convert, CURLU_URLENCODE | CURLU_APPENDQUERY);
+    }
+    CURL *curl = icecurl_easy_init ();
+    if (curl)
+    {
+        curl_easy_setopt (curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt (curl, CURLOPT_CURLU, url);
+        curl_easy_setopt (curl, CURLOPT_HEADERFUNCTION, listener_header);
+        curl_easy_setopt (curl, CURLOPT_WRITEFUNCTION, listener_data);
+
+        // Perform the request, res will get the return code
+        CURLcode res = curl_easy_perform (curl);
+
+        // Check for errors
+        if (res != CURLE_OK)
+        {
+            fprintf (stderr, "curl_easy_perform() failed: %s\n",
+            curl_easy_strerror (res));
+        }
+        curl_easy_cleanup (curl);
+    }
+    curl_url_cleanup(url);
+}
+#endif /* HAVE_CURL */
+
+static void *listener_action_worker(void *arg)
+{
+    listener_action_task_t *list;
+
+    INFO0("Listener action worker thread started");
+    thread_mutex_lock (&_listener_action_lock);
+    listener_action_thread_running = 1;
+    /* TODO handle shutdown gracefully */
+    while (1)
+    {
+        while (listener_actions_head == NULL)
+            thread_cond_wait (&_listener_action_cond, &_listener_action_lock);
+
+        /* detach queued list */
+        list = listener_actions_head;
+        listener_actions_head = NULL;
+        listener_actions_tail = &listener_actions_head;
+        thread_mutex_unlock (&_listener_action_lock);
+
+        while (list)
+        {
+            listener_action_task_t *t = list;
+            list = list->next;
+            if (t->action_url && t->action_url[0])
+            {
+#if HAVE_CURL
+                listener_action_report(t);
+#endif
+            }
+            listener_action_free_task(t);
+        }
+
+        thread_mutex_lock (&_listener_action_lock);
+    }
+    listener_action_thread_running = 0;
+    thread_mutex_unlock (&_listener_action_lock);
+    return NULL;
+}
+
+static void listener_action_queue(const client_t *client, const char *action, listener_action_type_t type, char *user_agent)
+{
+    listener_action_task_t *task = malloc(sizeof(*task));
+    if (!task) return;
+    task->type = type;
+    task->id = client->connection.id;
+    task->ip = client->connection.ip ? strdup(client->connection.ip) : NULL;
+    task->user_agent = user_agent;
+    task->mount = client->mount;
+    task->action_url = action;
+    task->next = NULL;
+
+    thread_mutex_lock (&_listener_action_lock);
+    if (listener_action_thread_running)
+    {
+        *listener_actions_tail = task;
+        listener_actions_tail = &task->next;
+        thread_cond_signal (&_listener_action_cond);
+    }
+    else
+    {
+        listener_action_free_task(task);
+    }
+    thread_mutex_unlock (&_listener_action_lock);
+
+}
+
+/* Hook called when a listener is successfully added to a source.
+ * Parameters:
+ *  - client: pointer to the `client_t` for the listener (contains IP, port, listener id, etc.)
+ *  - action: configured listener action url
+ */
+static void listener_connected_hook(client_t *client, const char *action)
+{
+    char* user_agent = client->parser ? strdup(httpp_getvar (client->parser, "user-agent")) : NULL;
+    listener_action_queue(client, action, LISTENER_ACTION_CONNECT, user_agent);
+}
+
+/* Hook called when a listener disconnects. Parameters:
+ *  - client: pointer to the `client_t` for the listener
+ *  - action: configured listener action address (may be NULL)
+ */
+static void listener_disconnected_hook(client_t *client, const char *action)
+{
+    listener_action_queue(client, action, LISTENER_ACTION_DISCONNECT, NULL);
+}
+
+void source_listener_initialize(void)
+{
+    thread_mutex_create (&_listener_action_lock);
+    thread_cond_create (&_listener_action_cond);
+    thread_create ("listener-action", listener_action_worker, NULL, THREAD_DETACHED);
+}
 
 struct _client_functions source_client_ops =
 {
@@ -2626,6 +2810,13 @@ static int source_listener_release (source_t *source, client_t *client)
 
     if (mountinfo && mountinfo->access_log.name)
         logging_access_id (&mountinfo->access_log, client);
+    {
+        /* notify about listener disconnect */
+        ice_config_t *cfg = config_get_config();
+        const char *action = cfg ? cfg->listener_actions.disconnect : NULL;
+        config_release_config();
+        listener_disconnected_hook(client, action);
+    }
 
     ret = auth_release_listener (client, source->mount, mountinfo);
     config_release_mount (mountinfo);
@@ -2646,6 +2837,7 @@ int source_add_listener (const char *mount, mount_proxy *mountinfo, client_t *cl
     ice_config_t *config = config_get_config();
     int64_t max_bandwidth = config->max_bandwidth;
     unsigned int max_listeners = config->max_listeners;
+    const char *listener_action = config->listener_actions.connect;
     config_release_config();
 
     do
@@ -2880,9 +3072,12 @@ int source_add_listener (const char *mount, mount_proxy *mountinfo, client_t *cl
 
     stats_event_inc (NULL, "listener_connections");
 
-    if (do_process) // send something back quickly
-        return client->ops->process (client);
-    return 0;
+    int result = 0;
+    if (do_process) { // send something back quickly
+        result = client->ops->process (client);
+        listener_connected_hook(client, listener_action);
+    }
+    return result;
 }
 
 

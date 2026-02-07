@@ -58,6 +58,7 @@
 #include "client.h"
 #include "slave.h"
 #include "stats.h"
+#include "source.h"
 #include "logging.h"
 #include "xslt.h"
 #include "fserve.h"
@@ -103,6 +104,7 @@ void initialize_subsystems(void)
     sock_initialize();
     resolver_initialize();
     config_initialize();
+    source_listener_initialize();
     connection_initialize();
     refbuf_initialize();
 

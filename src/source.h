@@ -141,6 +141,8 @@ void source_listeners_wakeup (source_t *source);
 
 int check_duplicate_logins (const char *mount, avl_tree *tree, client_t *client, auth_t *auth);
 
+void source_listener_initialize(void);
+
 #define SOURCE_BLOCK_SYNC           01
 #define SOURCE_QUEUE_BLOCK          REFBUF_SHARED
 
