@@ -657,6 +657,8 @@ void config_clear(ice_config_t *c)
     if (c->banfile) xmlFree(c->banfile);
     if (c->allowfile) xmlFree (c->allowfile);
     if (c->agentfile) xmlFree (c->agentfile);
+    if (c->listener_actions.connect) xmlFree(c->listener_actions.connect);
+    if (c->listener_actions.disconnect) xmlFree(c->listener_actions.disconnect);
     if (c->preroll_log.name) xmlFree(c->preroll_log.name);
     if (c->playlist_log.name) xmlFree(c->playlist_log.name);
     if (c->access_log.name) xmlFree(c->access_log.name);
@@ -855,6 +857,8 @@ static void _set_defaults(ice_config_t *configuration)
     configuration->log_dir = (char *)xmlCharStrdup (CONFIG_DEFAULT_LOG_DIR);
     configuration->webroot_dir = (char *)xmlCharStrdup (CONFIG_DEFAULT_WEBROOT_DIR);
     configuration->adminroot_dir = (char *)xmlCharStrdup (CONFIG_DEFAULT_ADMINROOT_DIR);
+    configuration->listener_actions.connect = NULL;
+    configuration->listener_actions.disconnect = NULL;
     configuration->playlist_log.name = (char *)xmlCharStrdup (CONFIG_DEFAULT_PLAYLIST_LOG);
     configuration->access_log.name = (char *)xmlCharStrdup (CONFIG_DEFAULT_ACCESS_LOG);
     configuration->access_log.log_ip = 1;
@@ -1090,6 +1094,22 @@ static int _parse_logging (cfg_xml *cfg, void *arg)
         config->access_log.archive = old_archive;
     if (config->playlist_log.archive == -1)
         config->playlist_log.archive = old_archive;
+
+    return 1;
+}
+
+static int _parse_listener_actions (cfg_xml *cfg, void *arg)
+{
+    ice_config_t *config = cfg->config;
+    struct cfg_tag icecast_tags[] =
+    {
+        { "connect",      config_get_str,     &config->listener_actions.connect },
+        { "disconnect",   config_get_str,     &config->listener_actions.disconnect },
+        { NULL, NULL, NULL }
+    };
+
+    if (parse_xml_tags (cfg, icecast_tags) < 0)
+        return -1;
 
     return 1;
 }
@@ -1898,6 +1918,7 @@ static int _parse_root (cfg_xml *cfg, void *p)
         { "redirect",           _parse_redirect },
         { "shoutcast-mount",    config_get_str,     &config->shoutcast_mount },
         { "listen-socket",      _parse_listen_sock,             .flags = CFG_TAG_NOTATTR|CFG_TAG_ALLOW_MANY },
+        { "listener-actions",   _parse_listener_actions,        .flags = CFG_TAG_NOTATTR },
         { "limits",             _parse_limits,                  .flags = CFG_TAG_NOTATTR },
         { "http-headers",       _parse_http_headers,    &config->http_headers,  .flags = CFG_TAG_NOTATTR },
         { "relay",              _parse_relay,                   .flags = CFG_TAG_NOTATTR|CFG_TAG_ALLOW_MANY },

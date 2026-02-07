@@ -292,6 +292,11 @@ typedef struct
     char *password;
 } ice_master_details;
 
+typedef struct 
+{
+    char *connect;
+    char *disconnect;
+} listener_actions;
 
 typedef struct ice_config_tag
 {
@@ -368,6 +373,7 @@ typedef struct ice_config_tag
     char *cipher_list;
     char *webroot_dir;
     char *adminroot_dir;
+    listener_actions listener_actions;
     struct _aliases *aliases;
     unsigned slaves_count;
 
