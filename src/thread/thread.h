@@ -134,7 +134,7 @@ int thread_rw_lock_callback (void **p, const char *filename, size_t line, int lo
 #define thread_cond_create(x) thread_cond_create_c(x,__LINE__,__FILE__)
 #define thread_cond_signal(x) thread_cond_signal_c(x,__LINE__,__FILE__)
 #define thread_cond_broadcast(x) thread_cond_broadcast_c(x,__LINE__,__FILE__)
-#define thread_cond_wait(x) thread_cond_wait_c(x,__LINE__,__FILE__)
+#define thread_cond_wait(x,m) thread_cond_wait_c(x,m,__LINE__,__FILE__)
 #define thread_cond_timedwait(x,m,t) thread_cond_timedwait_c(x,m,t,__LINE__,__FILE__)
 #define thread_rwlock_create(x) thread_rwlock_create_c(__FILE__,(x),__LINE__,__FILE__)
 #define thread_rwlock_rlock(x) thread_rwlock_rlock_c(x,__LINE__,__FILE__)
