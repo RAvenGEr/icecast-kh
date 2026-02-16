@@ -110,6 +110,7 @@ typedef struct listener_action_task_s {
     char *user_agent;
     const char *mount;
     const char *action_url;
+    const char *bearer_token;
 } listener_action_task_t;
 
 static mutex_t _listener_action_lock;
@@ -145,7 +146,7 @@ static size_t listener_data (void *ptr, size_t size, size_t nmemb, void *user)
 static void listener_action_report(listener_action_task_t* t)
 {
     CURLU *url = curl_url ();
-    CURLUcode rc = curl_url_set (url, CURLUPART_URL, t->action_url, 0);
+    curl_url_set (url, CURLUPART_URL, t->action_url, 0);
     char convert[100];
     snprintf (convert, sizeof(convert), "id=%"PRIu64, t->id);
     curl_url_set (url, CURLUPART_QUERY, convert, 0);
@@ -165,6 +166,17 @@ static void listener_action_report(listener_action_task_t* t)
     CURL *curl = icecurl_easy_init ();
     if (curl)
     {
+        struct curl_slist *headers = NULL;
+        if (t->bearer_token)
+        {
+            char *bearer;
+            if (asprintf (&bearer, "Authorization: Bearer %s", t->bearer_token) > 0)
+            {
+                headers = curl_slist_append (headers, bearer);
+                curl_easy_setopt (curl, CURLOPT_HTTPHEADER, headers);
+                free (bearer);
+            }
+        }
         curl_easy_setopt (curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt (curl, CURLOPT_CURLU, url);
         curl_easy_setopt (curl, CURLOPT_HEADERFUNCTION, listener_header);
@@ -179,6 +191,8 @@ static void listener_action_report(listener_action_task_t* t)
             fprintf (stderr, "curl_easy_perform() failed: %s\n",
             curl_easy_strerror (res));
         }
+        if (headers)
+            curl_slist_free_all (headers);
         curl_easy_cleanup (curl);
     }
     curl_url_cleanup(url);
@@ -224,7 +238,7 @@ static void *listener_action_worker(void *arg)
     return NULL;
 }
 
-static void listener_action_queue(const client_t *client, const char *action, listener_action_type_t type, char *user_agent)
+static void listener_action_queue(const client_t *client, const char *action, listener_action_type_t type, char *user_agent, const char *bearer_token)
 {
     listener_action_task_t *task = malloc(sizeof(*task));
     if (!task) return;
@@ -232,6 +246,7 @@ static void listener_action_queue(const client_t *client, const char *action, li
     task->id = client->connection.id;
     task->ip = client->connection.ip ? strdup(client->connection.ip) : NULL;
     task->user_agent = user_agent;
+    task->bearer_token = bearer_token;
     task->mount = client->mount;
     task->action_url = action;
     task->next = NULL;
@@ -256,19 +271,19 @@ static void listener_action_queue(const client_t *client, const char *action, li
  *  - client: pointer to the `client_t` for the listener (contains IP, port, listener id, etc.)
  *  - action: configured listener action url
  */
-static void listener_connected_hook(client_t *client, const char *action)
+static void listener_connected_hook(client_t *client, const char *action, const char *bearer_token)
 {
     char* user_agent = client->parser ? strdup(httpp_getvar (client->parser, "user-agent")) : NULL;
-    listener_action_queue(client, action, LISTENER_ACTION_CONNECT, user_agent);
+    listener_action_queue(client, action, LISTENER_ACTION_CONNECT, user_agent, bearer_token);
 }
 
 /* Hook called when a listener disconnects. Parameters:
  *  - client: pointer to the `client_t` for the listener
  *  - action: configured listener action address (may be NULL)
  */
-static void listener_disconnected_hook(client_t *client, const char *action)
+static void listener_disconnected_hook(client_t *client, const char *action, const char *bearer_token)
 {
-    listener_action_queue(client, action, LISTENER_ACTION_DISCONNECT, NULL);
+    listener_action_queue(client, action, LISTENER_ACTION_DISCONNECT, NULL, bearer_token);
 }
 
 void source_listener_initialize(void)
@@ -2814,8 +2829,9 @@ static int source_listener_release (source_t *source, client_t *client)
         /* notify about listener disconnect */
         ice_config_t *cfg = config_get_config();
         const char *action = cfg ? cfg->listener_actions.disconnect : NULL;
+        const char *token = cfg ? cfg->listener_actions.bearer_token : NULL;
         config_release_config();
-        listener_disconnected_hook(client, action);
+        listener_disconnected_hook(client, action, token);
     }
 
     ret = auth_release_listener (client, source->mount, mountinfo);
@@ -3074,8 +3090,11 @@ int source_add_listener (const char *mount, mount_proxy *mountinfo, client_t *cl
 
     int result = 0;
     if (do_process) { // send something back quickly
+        ice_config_t *cfg = config_get_config();
+        const char *token = cfg ? cfg->listener_actions.bearer_token : NULL;
+        config_release_config();
         result = client->ops->process (client);
-        listener_connected_hook(client, listener_action);
+        listener_connected_hook(client, listener_action, token);
     }
     return result;
 }

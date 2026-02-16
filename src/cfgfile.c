@@ -659,6 +659,7 @@ void config_clear(ice_config_t *c)
     if (c->agentfile) xmlFree (c->agentfile);
     if (c->listener_actions.connect) xmlFree(c->listener_actions.connect);
     if (c->listener_actions.disconnect) xmlFree(c->listener_actions.disconnect);
+    if (c->listener_actions.bearer_token) xmlFree(c->listener_actions.bearer_token);
     if (c->preroll_log.name) xmlFree(c->preroll_log.name);
     if (c->playlist_log.name) xmlFree(c->playlist_log.name);
     if (c->access_log.name) xmlFree(c->access_log.name);
@@ -859,6 +860,7 @@ static void _set_defaults(ice_config_t *configuration)
     configuration->adminroot_dir = (char *)xmlCharStrdup (CONFIG_DEFAULT_ADMINROOT_DIR);
     configuration->listener_actions.connect = NULL;
     configuration->listener_actions.disconnect = NULL;
+    configuration->listener_actions.bearer_token = NULL;
     configuration->playlist_log.name = (char *)xmlCharStrdup (CONFIG_DEFAULT_PLAYLIST_LOG);
     configuration->access_log.name = (char *)xmlCharStrdup (CONFIG_DEFAULT_ACCESS_LOG);
     configuration->access_log.log_ip = 1;
@@ -1105,6 +1107,7 @@ static int _parse_listener_actions (cfg_xml *cfg, void *arg)
     {
         { "connect",      config_get_str,     &config->listener_actions.connect },
         { "disconnect",   config_get_str,     &config->listener_actions.disconnect },
+        { "bearer-token", config_get_str,     &config->listener_actions.bearer_token },
         { NULL, NULL, NULL }
     };
 
