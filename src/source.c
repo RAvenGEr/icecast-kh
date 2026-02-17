@@ -60,6 +60,7 @@
 #include "auth.h"
 #include "slave.h"
 #include "curl_ice.h"
+#include "params.h"
 
 #undef CATMODULE
 #define CATMODULE "source"
@@ -106,6 +107,8 @@ typedef struct listener_action_task_s {
     struct listener_action_task_s *next;
     listener_action_type_t type;
     uint64_t id;
+    time_t event_time;
+    unsigned event_msec;
     char *ip;
     char *user_agent;
     const char *mount;
@@ -145,44 +148,68 @@ static size_t listener_data (void *ptr, size_t size, size_t nmemb, void *user)
 
 static void listener_action_report(listener_action_task_t* t)
 {
-    CURLU *url = curl_url ();
-    curl_url_set (url, CURLUPART_URL, t->action_url, 0);
-    char convert[100];
-    snprintf (convert, sizeof(convert), "id=%"PRIu64, t->id);
-    curl_url_set (url, CURLUPART_QUERY, convert, 0);
-    if (t->mount[0] == '/') ++t->mount;
-    snprintf (convert, sizeof(convert), "m=%s", t->mount);
-    curl_url_set (url, CURLUPART_QUERY, convert, CURLU_URLENCODE | CURLU_APPENDQUERY);
-    if (t->user_agent)
-    {
-        snprintf (convert, sizeof(convert), "ua=%s", t->user_agent);
-        curl_url_set (url, CURLUPART_QUERY, convert, CURLU_URLENCODE | CURLU_APPENDQUERY);
+    char event_time_str[40];
+    struct tm event_utc;
+    size_t event_time_len = 0;
+
+    if (gmtime_r (&t->event_time, &event_utc))
+        event_time_len = strftime (event_time_str, sizeof(event_time_str), "%Y-%m-%dT%H:%M:%S", &event_utc);
+    if (event_time_len > 0)
+        snprintf (event_time_str + event_time_len, sizeof(event_time_str) - event_time_len, ".%03uZ", t->event_msec);
+    else
+        snprintf (event_time_str, sizeof(event_time_str), "1970-01-01T00:00:00.000Z");
+
+    const char *event_kind = (t->type == LISTENER_ACTION_CONNECT) ? "listener_connect" : "listener_disconnect";
+    const char *relay = "first";
+    int64_t conn_id = (int64_t)t->id;
+
+
+    // Build JSON payload
+    refbuf_t *rb = refbuf_new(1024);
+    if (rb == NULL) {
+        WARN1 ("Failed to allocate JSON buffer for client %" PRIu64, t->id);
+        config_release_config ();
+        return;
     }
-    if (t->ip)
-    {
-        snprintf (convert, sizeof(convert), "ip=%s", t->ip);
-        curl_url_set (url, CURLUPART_QUERY, convert, CURLU_URLENCODE | CURLU_APPENDQUERY);
+
+    size_t len = 0;
+    len += snprintf (rb->data + len, rb->len - len,
+            "{\"time\":\"%s\",\"event_kind\":\"%s\",\"conn_id\":%" PRId64 ",\"relay\":\"%s\","
+            "\"client_ip\":\"%s\",\"user_agent\":\"%s\",\"path\":\"%s\"}",
+            event_time_str, event_kind, conn_id, relay, t->ip, t->user_agent, t->mount);
+
+    if (len >= rb->len) {
+        WARN1 ("JSON buffer too small for client %" PRIu64, t->id);
+        refbuf_release (rb);
+        return;
     }
+
+    rb->len = len;
+
     CURL *curl = icecurl_easy_init ();
     if (curl)
     {
         struct curl_slist *headers = NULL;
+        headers = curl_slist_append (headers, "Content-Type: application/json");
+
         if (t->bearer_token)
         {
             char *bearer;
             if (asprintf (&bearer, "Authorization: Bearer %s", t->bearer_token) > 0)
             {
                 headers = curl_slist_append (headers, bearer);
-                curl_easy_setopt (curl, CURLOPT_HTTPHEADER, headers);
                 free (bearer);
             }
         }
+
+        curl_easy_setopt (curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt (curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt (curl, CURLOPT_CURLU, url);
+        curl_easy_setopt (curl, CURLOPT_URL, t->action_url);
+        curl_easy_setopt (curl, CURLOPT_POSTFIELDS, rb->data);
         curl_easy_setopt (curl, CURLOPT_HEADERFUNCTION, listener_header);
         curl_easy_setopt (curl, CURLOPT_WRITEFUNCTION, listener_data);
 
-        // Perform the request, res will get the return code
+        // Perform the request
         CURLcode res = curl_easy_perform (curl);
 
         // Check for errors
@@ -195,7 +222,7 @@ static void listener_action_report(listener_action_task_t* t)
             curl_slist_free_all (headers);
         curl_easy_cleanup (curl);
     }
-    curl_url_cleanup(url);
+    refbuf_release (rb);
 }
 #endif /* HAVE_CURL */
 
@@ -220,6 +247,7 @@ static void *listener_action_worker(void *arg)
 
         while (list)
         {
+            thread_sleep (5000);
             listener_action_task_t *t = list;
             list = list->next;
             if (t->action_url && t->action_url[0])
@@ -240,10 +268,13 @@ static void *listener_action_worker(void *arg)
 
 static void listener_action_queue(const client_t *client, const char *action, listener_action_type_t type, char *user_agent, const char *bearer_token)
 {
+    uint64_t event_ms = (client && client->worker) ? client->worker->time_ms : timing_get_time ();
     listener_action_task_t *task = malloc(sizeof(*task));
     if (!task) return;
     task->type = type;
     task->id = client->connection.id;
+    task->event_time = (time_t)(event_ms / 1000);
+    task->event_msec = (unsigned)(event_ms % 1000);
     task->ip = client->connection.ip ? strdup(client->connection.ip) : NULL;
     task->user_agent = user_agent;
     task->bearer_token = bearer_token;
@@ -3501,4 +3532,3 @@ int listener_change_worker (client_t *client, source_t *source)
         thread_rwlock_unlock (&workers_lock);
     return ret;
 }
-
