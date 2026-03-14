@@ -5,6 +5,7 @@
 *.o
 *.exe
 *~
+Makefile
 /autom4te.cache/
 /conf/icecast.xml.dist
 /conf/icecast_minimal.xml.dist

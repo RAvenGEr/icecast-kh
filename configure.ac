@@ -153,6 +153,13 @@ XIPH_PATH_CURL([
         ])
     ],[ AC_MSG_NOTICE([libcurl not found])
     ])
+dnl -- MessagePack support for listener reports --
+PKG_CHECK_MODULES([MSGPACK], [msgpack >= 3.0],
+    [ AC_DEFINE([HAVE_MSGPACK], 1, [Define if msgpack is available])
+    XIPH_VAR_APPEND([XIPH_CPPFLAGS],[$MSGPACK_CFLAGS])
+    XIPH_VAR_PREPEND([XIPH_LIBS],[$MSGPACK_LIBS])
+    ], [ AC_MSG_NOTICE([libmsgpack not found - using JSON for listener reports])
+    ])
 dnl -- YP support --
 AC_ARG_ENABLE([yp],
         AS_HELP_STRING([--disable-yp],[disable YP directory support]),

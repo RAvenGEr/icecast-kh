@@ -297,6 +297,7 @@ typedef struct
     char *connect;
     char *disconnect;
     char *bearer_token;
+	char *relay;
 } listener_actions;
 
 typedef struct ice_config_tag

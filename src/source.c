@@ -62,6 +62,10 @@
 #include "curl_ice.h"
 #include "params.h"
 
+#ifdef HAVE_MSGPACK
+#include <msgpack.h>
+#endif
+
 #undef CATMODULE
 #define CATMODULE "source"
 
@@ -107,13 +111,10 @@ typedef struct listener_action_task_s {
     struct listener_action_task_s *next;
     listener_action_type_t type;
     uint64_t id;
-    time_t event_time;
-    unsigned event_msec;
     char *ip;
     char *user_agent;
     const char *mount;
-    const char *action_url;
-    const char *bearer_token;
+    const listener_actions *cfg;
 } listener_action_task_t;
 
 static mutex_t _listener_action_lock;
@@ -148,64 +149,124 @@ static size_t listener_data (void *ptr, size_t size, size_t nmemb, void *user)
 
 static void listener_action_report(listener_action_task_t* t)
 {
-    char event_time_str[40];
-    struct tm event_utc;
-    size_t event_time_len = 0;
+    refbuf_t *rb = NULL;
+    const char* action_url = t->type == LISTENER_ACTION_CONNECT ? t->cfg->connect : t->cfg->disconnect;
+    if (action_url == NULL) return;
 
-    if (gmtime_r (&t->event_time, &event_utc))
-        event_time_len = strftime (event_time_str, sizeof(event_time_str), "%Y-%m-%dT%H:%M:%S", &event_utc);
-    if (event_time_len > 0)
-        snprintf (event_time_str + event_time_len, sizeof(event_time_str) - event_time_len, ".%03uZ", t->event_msec);
-    else
-        snprintf (event_time_str, sizeof(event_time_str), "1970-01-01T00:00:00.000Z");
+    const char *action = (t->type == LISTENER_ACTION_CONNECT) ? "listener_connect" : "listener_disconnect";
+#ifdef HAVE_MSGPACK
+    msgpack_sbuffer sbuf;
+    msgpack_packer pk;
+    msgpack_sbuffer_init(&sbuf);
+    msgpack_packer_init(&pk, &sbuf, msgpack_sbuffer_write);
 
-    const char *event_kind = (t->type == LISTENER_ACTION_CONNECT) ? "listener_connect" : "listener_disconnect";
-    const char *relay = "first";
-    int64_t conn_id = (int64_t)t->id;
+    const char *mount = t->mount;
+    if (mount && mount[0] == '/') ++mount;
 
+    int field_count = 3;
+    if (mount) field_count++;
+    if (t->ip) field_count++;
+    if (t->user_agent) field_count++;
 
-    // Build JSON payload
-    refbuf_t *rb = refbuf_new(1024);
+    msgpack_pack_map(&pk, field_count);
+
+    msgpack_pack_str(&pk, 6);
+    msgpack_pack_str_body(&pk, "action", 6);
+    msgpack_pack_str(&pk, strlen(action));
+    msgpack_pack_str_body(&pk, action, strlen(action));
+
+    msgpack_pack_str(&pk, 7);
+    msgpack_pack_str_body(&pk, "conn_id", 7);
+    msgpack_pack_uint64(&pk, t->id);
+
+    msgpack_pack_str(&pk, 5);
+    msgpack_pack_str_body(&pk, "relay", 5);
+    msgpack_pack_str(&pk, strlen(t->cfg->relay));
+    msgpack_pack_str_body(&pk, t->cfg->relay, strlen(t->cfg->relay));
+
+    if (mount) {
+        msgpack_pack_str(&pk, 5);
+        msgpack_pack_str_body(&pk, "mount", 5);
+        msgpack_pack_str(&pk, strlen(mount));
+        msgpack_pack_str_body(&pk, mount, strlen(mount));
+    }
+
+    if (t->ip) {
+        msgpack_pack_str(&pk, 2);
+        msgpack_pack_str_body(&pk, "ip", 2);
+        msgpack_pack_str(&pk, strlen(t->ip));
+        msgpack_pack_str_body(&pk, t->ip, strlen(t->ip));
+    }
+
+    if (t->user_agent) {
+        msgpack_pack_str(&pk, 5);
+        msgpack_pack_str_body(&pk, "agent", 5);
+        msgpack_pack_str(&pk, strlen(t->user_agent));
+        msgpack_pack_str_body(&pk, t->user_agent, strlen(t->user_agent));
+    }
+
+    rb = refbuf_new(sbuf.size);
+    if (rb) {
+        memcpy(rb->data, sbuf.data, sbuf.size);
+        rb->len = sbuf.size;
+    }
+    msgpack_sbuffer_destroy(&sbuf);
+#else
+    ice_params_t post;
+    ice_params_setup (&post, "=", "&", PARAMS_ESC);
+
+    ice_params_printf (&post, "action", PARAM_AS, "%s", action);
+    ice_params_printf (&post, "conn_id", PARAM_AS, "%" PRIu64, t->id);
+
+    const char *mount = t->mount;
+    if (mount && mount[0] == '/') ++mount;
+    ice_params_printf (&post, "mount", 0, "%s", mount ? mount : "");
+
+    if (t->ip)
+        ice_params_printf (&post, "ip", 0, "%s", t->ip);
+
+    if (t->user_agent)
+        ice_params_printf (&post, "agent", 0, "%s", t->user_agent);
+
+    rb = ice_params_complete (&post);
+#endif
+    
     if (rb == NULL) {
-        WARN1 ("Failed to allocate JSON buffer for client %" PRIu64, t->id);
-        config_release_config ();
+        WARN1 ("Failed to build listener action POST data for client %" PRIu64, t->id);
         return;
     }
-
-    size_t len = 0;
-    len += snprintf (rb->data + len, rb->len - len,
-            "{\"time\":\"%s\",\"event_kind\":\"%s\",\"conn_id\":%" PRId64 ",\"relay\":\"%s\","
-            "\"client_ip\":\"%s\",\"user_agent\":\"%s\",\"path\":\"%s\"}",
-            event_time_str, event_kind, conn_id, relay, t->ip, t->user_agent, t->mount);
-
-    if (len >= rb->len) {
-        WARN1 ("JSON buffer too small for client %" PRIu64, t->id);
-        refbuf_release (rb);
+    if ( rb->len != (long)rb->len) {
+	WARN1 ("Listener action POST data for client %" PRIu64 " is invalid", t->id);
+    	refbuf_release (rb);
         return;
     }
-
-    rb->len = len;
-
     CURL *curl = icecurl_easy_init ();
     if (curl)
     {
         struct curl_slist *headers = NULL;
-        headers = curl_slist_append (headers, "Content-Type: application/json");
 
-        if (t->bearer_token)
+#ifdef HAVE_MSGPACK
+        headers = curl_slist_append (headers, "Content-Type: application/msgpack");
+#else
+        headers = curl_slist_append (headers, "Content-Type: application/x-www-form-urlencoded");
+#endif
+
+        if (t->cfg->bearer_token)
         {
             char *bearer;
-            if (asprintf (&bearer, "Authorization: Bearer %s", t->bearer_token) > 0)
+            if (asprintf (&bearer, "Authorization: Bearer %s", t->cfg->bearer_token) > 0)
             {
                 headers = curl_slist_append (headers, bearer);
                 free (bearer);
             }
         }
+	const char* action_url = t->type == LISTENER_ACTION_CONNECT? t->cfg->connect : t->cfg->disconnect;
 
         curl_easy_setopt (curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt (curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt (curl, CURLOPT_URL, t->action_url);
+        curl_easy_setopt (curl, CURLOPT_URL, action_url);
         curl_easy_setopt (curl, CURLOPT_POSTFIELDS, rb->data);
+        curl_easy_setopt (curl, CURLOPT_POSTFIELDSIZE, (long)rb->len);
         curl_easy_setopt (curl, CURLOPT_HEADERFUNCTION, listener_header);
         curl_easy_setopt (curl, CURLOPT_WRITEFUNCTION, listener_data);
 
@@ -215,7 +276,7 @@ static void listener_action_report(listener_action_task_t* t)
         // Check for errors
         if (res != CURLE_OK)
         {
-            fprintf (stderr, "curl_easy_perform() failed: %s\n",
+            WARN1 ("Listener action curl_easy_perform() failed: %s\n",
             curl_easy_strerror (res));
         }
         if (headers)
@@ -247,15 +308,11 @@ static void *listener_action_worker(void *arg)
 
         while (list)
         {
-            thread_sleep (5000);
             listener_action_task_t *t = list;
             list = list->next;
-            if (t->action_url && t->action_url[0])
-            {
 #if HAVE_CURL
-                listener_action_report(t);
+            listener_action_report(t);
 #endif
-            }
             listener_action_free_task(t);
         }
 
@@ -266,20 +323,17 @@ static void *listener_action_worker(void *arg)
     return NULL;
 }
 
-static void listener_action_queue(const client_t *client, const char *action, listener_action_type_t type, char *user_agent, const char *bearer_token)
+static void listener_action_queue(const client_t *client, listener_action_type_t type, char *user_agent, const listener_actions *cfg)
 {
-    uint64_t event_ms = (client && client->worker) ? client->worker->time_ms : timing_get_time ();
+    if (cfg == NULL || cfg->connect == NULL || cfg->disconnect == NULL || cfg->relay == NULL ) return;
     listener_action_task_t *task = malloc(sizeof(*task));
     if (!task) return;
     task->type = type;
     task->id = client->connection.id;
-    task->event_time = (time_t)(event_ms / 1000);
-    task->event_msec = (unsigned)(event_ms % 1000);
     task->ip = client->connection.ip ? strdup(client->connection.ip) : NULL;
     task->user_agent = user_agent;
-    task->bearer_token = bearer_token;
     task->mount = client->mount;
-    task->action_url = action;
+    task->cfg = cfg;
     task->next = NULL;
 
     thread_mutex_lock (&_listener_action_lock);
@@ -294,7 +348,6 @@ static void listener_action_queue(const client_t *client, const char *action, li
         listener_action_free_task(task);
     }
     thread_mutex_unlock (&_listener_action_lock);
-
 }
 
 /* Hook called when a listener is successfully added to a source.
@@ -302,19 +355,19 @@ static void listener_action_queue(const client_t *client, const char *action, li
  *  - client: pointer to the `client_t` for the listener (contains IP, port, listener id, etc.)
  *  - action: configured listener action url
  */
-static void listener_connected_hook(client_t *client, const char *action, const char *bearer_token)
+static void listener_connected_hook(client_t *client, const listener_actions *cfg)
 {
     char* user_agent = client->parser ? strdup(httpp_getvar (client->parser, "user-agent")) : NULL;
-    listener_action_queue(client, action, LISTENER_ACTION_CONNECT, user_agent, bearer_token);
+    listener_action_queue(client, LISTENER_ACTION_CONNECT, user_agent, cfg);
 }
 
 /* Hook called when a listener disconnects. Parameters:
  *  - client: pointer to the `client_t` for the listener
  *  - action: configured listener action address (may be NULL)
  */
-static void listener_disconnected_hook(client_t *client, const char *action, const char *bearer_token)
+static void listener_disconnected_hook(client_t *client, const listener_actions *cfg)
 {
-    listener_action_queue(client, action, LISTENER_ACTION_DISCONNECT, NULL, bearer_token);
+    listener_action_queue(client, LISTENER_ACTION_DISCONNECT, NULL, cfg);
 }
 
 void source_listener_initialize(void)
@@ -2859,10 +2912,11 @@ static int source_listener_release (source_t *source, client_t *client)
     {
         /* notify about listener disconnect */
         ice_config_t *cfg = config_get_config();
-        const char *action = cfg ? cfg->listener_actions.disconnect : NULL;
-        const char *token = cfg ? cfg->listener_actions.bearer_token : NULL;
+        const listener_actions *actions = cfg ? &cfg->listener_actions : NULL;
         config_release_config();
-        listener_disconnected_hook(client, action, token);
+	if (actions) {
+            listener_disconnected_hook(client, actions);
+	}
     }
 
     ret = auth_release_listener (client, source->mount, mountinfo);
@@ -2884,7 +2938,6 @@ int source_add_listener (const char *mount, mount_proxy *mountinfo, client_t *cl
     ice_config_t *config = config_get_config();
     int64_t max_bandwidth = config->max_bandwidth;
     unsigned int max_listeners = config->max_listeners;
-    const char *listener_action = config->listener_actions.connect;
     config_release_config();
 
     do
@@ -3122,10 +3175,13 @@ int source_add_listener (const char *mount, mount_proxy *mountinfo, client_t *cl
     int result = 0;
     if (do_process) { // send something back quickly
         ice_config_t *cfg = config_get_config();
-        const char *token = cfg ? cfg->listener_actions.bearer_token : NULL;
+        const listener_actions *actions = cfg ? &cfg->listener_actions: NULL;
         config_release_config();
         result = client->ops->process (client);
-        listener_connected_hook(client, listener_action, token);
+	
+	if (actions) {
+            listener_connected_hook(client, actions);
+	}
     }
     return result;
 }
